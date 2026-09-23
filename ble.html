@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JustinKey - BLE Auth Demo</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --accent:#00ff88; --text:#e6e6e6; --muted:#8b8d93; }
+  * { box-sizing:border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  body { background:var(--bg); color:var(--text); margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  .card { background:var(--card); border:1px solid #2a2d36; border-radius:16px; padding:28px; width:100%; max-width:580px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+  h1 { margin:0 0 6px; font-size:22px; letter-spacing:-0.5px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:20px; line-height:1.5; }
+  button { width:100%; background:var(--accent); color:#000; border:0; border-radius:10px; padding:14px; font-weight:700; font-size:15px; cursor:pointer; transition:0.2s; }
+  button:hover { filter:brightness(1.1); transform:translateY(-1px); }
+  button:disabled { background:#2a2d36; color:var(--muted); cursor:not-allowed; transform:none; }
+  .log { margin-top:18px; background:#0f1115; border:1px solid #2a2d36; border-radius:10px; padding:12px; font-size:12px; height:160px; overflow-y:auto; white-space:pre-wrap; line-height:1.6; }
+  .badge { display:inline-block; padding:3px 8px; border-radius:20px; font-size:10px; font-weight:700; letter-spacing:0.5px; }
+  .badge-ok { background:#00ff8830; color:var(--accent); border:1px solid #00ff8850; }
+  .badge-warn { background:#ffaa0030; color:#ffaa00; border:1px solid #ffaa0050; }
+  .secret-box { margin-top:18px; padding:16px; border-radius:10px; border:1px dashed var(--accent); background:#00ff8810; display:none; }
+  .secret-box h3 { margin:0 0 8px; font-size:13px; color:var(--accent); }
+  .secret-content { font-size:14px; line-height:1.6; color:#fff; }
+  .field { margin-top:14px; }
+  .field label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.8px; }
+  .field code { display:block; margin-top:4px; background:#0f1115; border:1px solid #2a2d36; padding:8px 10px; border-radius:8px; font-size:11px; word-break:break-all; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔐 JustinKey BLE Auth</h1>
+  <div class="sub">ESP32 + Web Bluetooth. Gumagana sa <b>Chrome Desktop at Android Chrome</b>. Kailangan HTTPS or localhost. Hindi keyboard typing - custom HMAC challenge-response.</div>
+  
+  <button id="connectBtn">Connect to JustinKey-ESP32</button>
+  
+  <div class="field">
+    <label>Status</label>
+    <div id="status" style="margin-top:6px;"><span class="badge badge-warn">DISCONNECTED</span></div>
+  </div>
+
+  <div class="log" id="log">Ready. I-plug mo ESP32, tapos pindutin Connect...
+- Dapat naka-ON ang Bluetooth ng device mo
+- Sa Android, dapat Chrome gamit mo (hindi FB browser)
+- Sa PC, Chrome / Edge lang supported ang Web Bluetooth
+</div>
+
+  <div class="secret-box" id="secretBox">
+    <h3>✅ AUTHENTICATED - Decrypted Content</h3>
+    <div class="secret-content" id="secretContent"></div>
+    <div style="margin-top:12px; font-size:11px; color:var(--muted);">Ito yung content na naka-AES-GCM encrypt. Na-decrypt lang kasi na-verify ng ESP32 yung challenge mo. Sa production, dapat nasa server ang verification.</div>
+  </div>
+
+  <div class="field">
+    <label>How it works (for demo)</label>
+    <code>Website -> random 32-byte challenge -> ESP32 -> HMAC-SHA256(challenge, secret) -> Website verifies -> AES-GCM decrypt</code>
+  </div>
+</div>
+
+<script>
+// --- CONFIG - DAPAT TUGMA SA ESP32 ---
+const SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
+const CHALLENGE_UUID = '12345678-1234-5678-1234-56789abcdef1';
+const RESPONSE_UUID = '12345678-1234-5678-1234-56789abcdef2';
+
+// Shared secret - same as ESP32 (hex)
+const SECRET_HEX = 'd894329fea2c43bf92160f8760aa071a7464de8a08cd8c169246110d0d175437';
+
+// Encrypted payload - AES-GCM encrypted with key = SHA256(SECRET)
+// Generated via Python: plaintext = "Congrats Justin!..."
+const NONCE_B64 = '2ykaZoMrsNFWAhYP';
+const CIPHERTEXT_B64 = '4cOgcHq6+XSJWZLCVAN8FTYKI2P5OuQrWd6sx2027hBFi7fDbzcmU8It7idfN2tpKKw/8NS9Hs9S3OToCPGmlESqpcuYrIToMeh76fbJNYAXW6Td8vQTddBx2Sg/FNJKkIUIQs9HWvsf+b1xsdBE0kSyosYp5SayUmNXXAUPavUTiR7aJ7ouAg==';
+
+let device, server, challengeChar, responseChar;
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const connectBtn = document.getElementById('connectBtn');
+const secretBox = document.getElementById('secretBox');
+const secretContent = document.getElementById('secretContent');
+
+function log(msg) {
+  const time = new Date().toLocaleTimeString();
+  logEl.textContent += `\n[${time}] ${msg}`;
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(msg);
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) bytes[i/2] = parseInt(hex.substr(i, 2), 16);
+  return bytes;
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToHex(bytes) {
+  return [...bytes].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+async function decryptContent() {
+  try {
+    const secretBytes = hexToBytes(SECRET_HEX);
+    // key = SHA256(secret)
+    const keyHash = await crypto.subtle.digest('SHA-256', secretBytes);
+    const aesKey = await crypto.subtle.importKey('raw', keyHash, {name:'AES-GCM'}, false, ['decrypt']);
+    const nonce = b64ToBytes(NONCE_B64);
+    const ciphertext = b64ToBytes(CIPHERTEXT_B64);
+    const decrypted = await crypto.subtle.decrypt({name:'AES-GCM', iv: nonce}, aesKey, ciphertext);
+    return new TextDecoder().decode(decrypted);
+  } catch(e) {
+    log('Decrypt error: ' + e.message);
+    return null;
+  }
+}
+
+connectBtn.onclick = async () => {
+  if (!navigator.bluetooth) {
+    log('❌ Web Bluetooth not supported. Gamit ka Chrome / Edge sa desktop o Android. Hindi gumagana sa iPhone at sa Facebook in-app browser.');
+    return;
+  }
+
+  try {
+    log('🔍 Searching for JustinKey-ESP32...');
+    statusEl.innerHTML = '<span class="badge badge-warn">SCANNING...</span>';
+    connectBtn.disabled = true;
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    log(`📡 Found: ${device.name}`);
+    device.addEventListener('gattserverdisconnected', () => {
+      log('⚠️ Disconnected');
+      statusEl.innerHTML = '<span class="badge badge-warn">DISCONNECTED</span>';
+      connectBtn.disabled = false;
+      connectBtn.textContent = 'Reconnect';
+    });
+
+    log('🔗 Connecting GATT...');
+    server = await device.gatt.connect();
+    
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    challengeChar = await service.getCharacteristic(CHALLENGE_UUID);
+    responseChar = await service.getCharacteristic(RESPONSE_UUID);
+
+    log('✅ Connected! Starting notifications...');
+    await responseChar.startNotifications();
+    
+    statusEl.innerHTML = '<span class="badge badge-ok">CONNECTED - AUTHENTICATING...</span>';
+
+    // Setup listener for response
+    let authResolver;
+    const authPromise = new Promise(resolve => authResolver = resolve);
+
+    responseChar.addEventListener('characteristicvaluechanged', async (event) => {
+      const value = new Uint8Array(event.target.value.buffer);
+      log(`📥 Response from ESP32: ${bytesToHex(value).slice(0,32)}... (${value.length} bytes)`);
+      
+      // Verify HMAC locally (DEMO ONLY - sa production dapat sa server mo i-verify)
+      const lastChallenge = window._lastChallenge;
+      if (!lastChallenge) return;
+
+      const secretBytes = hexToBytes(SECRET_HEX);
+      const key = await crypto.subtle.importKey('raw', secretBytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+      const expectedHmac = new Uint8Array(await crypto.subtle.sign('HMAC', key, lastChallenge));
+      
+      const isValid = bytesToHex(expectedHmac) === bytesToHex(value);
+      
+      if (isValid) {
+        log('✅ HMAC VALID! Authenticated via ESP32!');
+        statusEl.innerHTML = '<span class="badge badge-ok">AUTHENTICATED</span>';
+        
+        const decrypted = await decryptContent();
+        if (decrypted) {
+          secretContent.textContent = decrypted;
+          secretBox.style.display = 'block';
+          log('🔓 Content decrypted successfully!');
+        }
+        authResolver(true);
+      } else {
+        log('❌ HMAC INVALID! Fake device?');
+        log(`Expected: ${bytesToHex(expectedHmac)}`);
+        log(`Got:      ${bytesToHex(value)}`);
+        authResolver(false);
+      }
+    });
+
+    // Generate random challenge
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    window._lastChallenge = challenge;
+    log(`🎲 Challenge generated: ${bytesToHex(challenge).slice(0,32)}...`);
+    log('📤 Sending challenge to ESP32...');
+
+    await challengeChar.writeValue(challenge);
+    log('⏳ Waiting for ESP32 to compute HMAC...');
+
+    // Wait up to 5 sec
+    const result = await Promise.race([
+      authPromise,
+      new Promise(r => setTimeout(()=>r(false), 5000))
+    ]);
+
+    if (!result) {
+      log('⚠️ No valid response in 5s. Try again.');
+    }
+
+  } catch (err) {
+    log(`❌ Error: ${err.message}`);
+    console.error(err);
+    statusEl.innerHTML = '<span class="badge badge-warn">ERROR</span>';
+    connectBtn.disabled = false;
+  }
+};
+
+// Check support on load
+window.addEventListener('load', () => {
+  if (!navigator.bluetooth) {
+    log('⚠️ WARNING: Web Bluetooth API not found. Open this page in Chrome/Edge (desktop) or Chrome on Android. HTTPS required.');
+  } else {
+    log('✓ Web Bluetooth supported. Ready to connect.');
+  }
+});
+</script>
+</body>
+</html>
